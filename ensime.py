@@ -391,6 +391,7 @@ class EnsimeClientSocket(EnsimeCommon):
     self._connect_lock = threading.RLock()
     self._receiver = None
     self.socket = None
+    self._buf = ""
 
   def notify_async_data(self, data):
     for handler in self.handlers:
@@ -400,30 +401,26 @@ class EnsimeClientSocket(EnsimeCommon):
   def receive_loop(self):
     while self.connected:
       try:
-        msglen = self.socket.recv(6)
-        if msglen:
-          msglen = int(msglen, 16)
-          # self.log_client("RECV: incoming message of " + str(msglen) + " bytes")
+        header_len = 6
 
-          buf = ""
-          while len(buf) < msglen:
-            chunk = self.socket.recv(msglen - len(buf))
-            if chunk:
-              # self.log_client("RECV: received a chunk of " + str(len(chunk)) + " bytes")
-              buf += chunk
-            else:
-              raise "fatal error: recv returned None"
-          self.log_client("RECV: " + buf)
+        read = self.socket.recv(4096)
+        if not read:
+          self.set_connected(False)
+          return
 
-          try:
-            s = buf.decode('utf-8')
+        self._buf += read
+        while len(self._buf) > header_len:
+          len_str = str(self._buf[:header_len])
+          payload_len = int(len_str, 16)
+          if len(self._buf) >= (header_len + payload_len):
+            msg = self._buf[header_len:header_len + payload_len]
+            s = msg.decode('utf-8')
             form = sexp.read(s)
             self.notify_async_data(form)
-          except:
-            self.log_client("failed to parse incoming message")
-            raise
-        else:
-          raise "fatal error: recv returned None"
+            self._buf = self._buf[payload_len + header_len:]
+          else:
+            break
+
       except Exception:
         self.log_client("*****    ERROR     *****")
         self.log_client(traceback.format_exc())
@@ -433,7 +430,10 @@ class EnsimeClientSocket(EnsimeCommon):
           self.env.controller.shutdown()
 
   def start_receiving(self):
-    t = threading.Thread(name = "ensime-client-" + str(self.w.id()) + "-" + str(self.port), target = self.receive_loop)
+    t = threading.Thread(
+      name="ensime-client-" +
+      str(self.w.id()) + "-" +
+      str(self.port), target = self.receive_loop)
     t.setDaemon(True)
     t.start()
     self._receiver = t
@@ -602,7 +602,6 @@ class EnsimeClient(EnsimeClientListener, EnsimeCommon):
     msg_str = sexp.to_string([key(":swank-rpc"), to_send, msg_id])
     msg_str = "%06x" % len(msg_str) + msg_str
 
-    self.feedback(msg_str)
     self.log_client("SEND ASYNC REQ: " + msg_str)
     self.socket.send(msg_str.encode('utf-8'))
 
@@ -613,7 +612,6 @@ class EnsimeClient(EnsimeClientListener, EnsimeCommon):
     msg_str = sexp.to_string([key(":swank-rpc"), to_send, msg_id])
     msg_str = "%06x" % len(msg_str) + msg_str
 
-    self.feedback(msg_str)
     self.log_client("SEND SYNC REQ: " + msg_str)
     self.socket.send(msg_str)
 
@@ -626,7 +624,6 @@ class EnsimeClient(EnsimeClientListener, EnsimeCommon):
 
   def on_client_async_data(self, data):
     self.log_client("SEND ASYNC RESP: " + str(data))
-    self.feedback(str(data))
     self.handle_message(data)
 
   # examples of responses can be seen here:
@@ -667,6 +664,7 @@ class EnsimeClient(EnsimeClientListener, EnsimeCommon):
           else:
             handler(payload)
         else:
+          # Wake up thread blocked on synchronous RPC call
           handler.payload = payload
           handler.set()
       else:
@@ -754,7 +752,7 @@ class EnsimeClient(EnsimeClientListener, EnsimeCommon):
   def feedback(self, msg):
     msg = msg.replace("\r\n", "\n").replace("\r", "\n") + "\n"
     self.log_client(msg.strip(), to_disk_only = True)
-    self.view_insert(self.env.cv, msg)
+    #self.view_insert(self.env.cv, msg)
 
 class EnsimeServerListener:
   def on_server_data(self, data):
@@ -924,7 +922,7 @@ class EnsimeServer(EnsimeServerListener, EnsimeCommon):
   def on_server_data(self, data):
     str_data = str(data).replace("\r\n", "\n").replace("\r", "\n")
     self.log_server(str_data.strip(), to_disk_only = True)
-    self.view_insert(self.env.sv, str_data)
+    #self.view_insert(self.env.sv, str_data)
 
   def shutdown(self):
     self.proc.kill()
@@ -987,7 +985,19 @@ class EnsimeController(EnsimeCommon, EnsimeClientListener, EnsimeServerListener)
 
   def response_handshake(self, server_info):
     self.status_message("Initializing... ")
-    req = ensime_codec.encode_initialize_project(self.env.project_config)
+    conf = self.env.project_config
+    m = sexp.sexp_to_key_map(conf)
+    subprojects = [sexp.sexp_to_key_map(p) for p in m.get(":subprojects",[])]
+    names = [p[":name"] for p in subprojects]
+
+    # TODO(aemoncannon)
+    # Prompt user for project.
+    name = None
+    if names:
+      name = names[0]
+    conf = conf + [key(":active-subproject"), name]
+
+    req = ensime_codec.encode_initialize_project(conf)
     self.client.async_req(req, lambda _: self.status_message("Ensime ready!"), call_back_into_ui_thread = True)
 
   def shutdown(self):
@@ -1216,16 +1226,18 @@ class EnsimeHighlights(EnsimeCommon):
 
   def show(self):
     relevant_notes = filter(lambda note: self.same_files(note.file_name, self.v.file_name()), self.env.notes)
-    errors = [self.v.full_line(note.start) for note in relevant_notes]
-    underlines = []
-    for note in self.env.notes:
-      underlines += [sublime.Region(int(pos)) for pos in range(note.start, note.end)]
+
+    # Underline specific error range
+    underlines = [sublime.Region(note.start, note.end) for note in self.env.notes]
     if self.env.settings.get("error_highlight") and self.env.settings.get("error_underline"):
       self.v.add_regions(
         "ensime-error-underline",
         underlines,
         "invalid.illegal",
         sublime.DRAW_EMPTY_AS_OVERWRITE)
+
+    # Outline entire errored line
+    errors = [self.v.full_line(note.start) for note in relevant_notes]
     if self.env.settings.get("error_highlight"):
       self.v.add_regions(
         "ensime-error",
@@ -1233,6 +1245,7 @@ class EnsimeHighlights(EnsimeCommon):
         "invalid.illegal",
         self.env.settings.get("error_icon", "dot"),
         sublime.DRAW_OUTLINED)
+
     if self.env.settings.get("error_status"):
       bol = self.v.line(self.v.sel()[0].begin()).begin()
       eol = self.v.line(self.v.sel()[0].begin()).end()
@@ -1293,7 +1306,11 @@ class EnsimeHighlightDaemon(EventListener):
   def on_load(self, view):
     self.with_api(view, lambda api: api.type_check_file(view.file_name()))
 
+  def on_pre_save(self, view):
+    print "PRE-SAVE"
+
   def on_post_save(self, view):
+    print "POST-SAVE"
     self.with_api(view, lambda api: api.type_check_file(view.file_name()))
 
   def on_activate(self, view):
@@ -1377,11 +1394,12 @@ class EnsimeCtrlTilde(EnsimeWindowCommand):
 
 class EnsimeCompletionsListener(EventListener):
   def on_query_completions(self, view, prefix, locations):
-    if not view.match_selector(locations[0], "source.scala"): return []
-    api = ensime_api(view)
-    completions = api.complete_member(view.file_name(), locations[0]) if api else None
-    if completions is None: return []
-    return ([(c.name + "\t" + c.signature, c.name) for c in completions], sublime.INHIBIT_EXPLICIT_COMPLETIONS | sublime.INHIBIT_WORD_COMPLETIONS)
+    pass
+#    if not view.match_selector(locations[0], "source.scala"): return []
+#    api = ensime_api(view)
+#    completions = api.complete_member(view.file_name(), locations[0]) if api else None
+#    if completions is None: return []
+#    return ([(c.name + "\t" + c.signature, c.name) for c in completions], sublime.INHIBIT_EXPLICIT_COMPLETIONS | sublime.INHIBIT_WORD_COMPLETIONS)
 
 class EnsimeInspectTypeAtPoint(ProjectFileOnly, EnsimeTextCommand):
   def run(self, edit, target= None):

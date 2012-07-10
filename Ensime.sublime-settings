@@ -17,7 +17,7 @@
 
   // debug settings
   "log_to_console": ["ui", "client", "server"],
-  "log_to_file": ["ui", "client", "server"],
+  "log_to_file": [],
   "connect_to_external_server": false,
   "external_server_port_file": "",
   "rpc_timeout": 3

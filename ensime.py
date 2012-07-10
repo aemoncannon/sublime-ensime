@@ -1,14 +1,18 @@
 import sublime
 from sublime import *
 from sublime_plugin import *
-import os, threading, thread, socket, getpass, subprocess, killableprocess, tempfile, datetime, time
+import os, threading, thread, socket, getpass, subprocess
+import killableprocess, tempfile, datetime, time
 import functools, inspect, traceback, random, re
 from sexp import sexp
 from sexp.sexp import key, sym
 from string import strip
+import env
+
+def environment_constructor(window):
+  return EnsimeEnvironment(window)
 
 class EnsimeApi:
-
   def type_check_file(self, file_path, on_complete = None):
     req = ensime_codec.encode_type_check_file(file_path)
     wrapped_on_complete = functools.partial(self.type_check_file_on_complete_wrapper, on_complete) if on_complete else None
@@ -19,15 +23,13 @@ class EnsimeApi:
 
   def add_notes(self, notes):
     self.env.notes += notes
-    for i in range(0, self.w.num_groups()):
-      v = self.w.active_view_in_group(i)
-      EnsimeHighlights(v).refresh()
+    for v in self.w.views():
+      EnsimeHighlights(v).show_notes(notes)
 
   def clear_notes(self):
     self.env.notes = []
-    for i in range(0, self.w.num_groups()):
-      v = self.w.active_view_in_group(i)
-      EnsimeHighlights(v).refresh()
+    for v in self.w.views():
+      EnsimeHighlights(v).hide()
 
   def inspect_type_at_point(self, file_path, position, on_complete):
     req = ensime_codec.encode_inspect_type_at_point(file_path, position)
@@ -50,29 +52,22 @@ class EnsimeApi:
   def symbol_at_point_on_complete_wrapper(self, on_complete, payload):
     return on_complete(ensime_codec.decode_symbol_at_point(payload))
 
-envLock = threading.RLock()
-ensime_envs = {}
-
-def get_ensime_env(window):
-  if window:
-    if window.id() in ensime_envs:
-      return ensime_envs[window.id()]
-    envLock.acquire()
-    try:
-      if not (window.id() in ensime_envs):
-        ensime_envs[window.id()] = EnsimeEnvironment(window)
-      return ensime_envs[window.id()]
-    finally:
-      envLock.release()
-  return None
 
 class EnsimeEnvironment(object):
+
   def __init__(self, window):
-    # plugin-wide stuff (immutable)
+    # immutable stuff
     self.settings = sublime.load_settings("Ensime.sublime-settings")
-    server_dir = self.settings.get("ensime_server_path", "sublime_ensime\\server" if os.name == 'nt' else "sublime_ensime/server")
-    self.server_path = server_dir if server_dir.startswith("/") or (":/" in server_dir) or (":\\" in server_dir) else os.path.join(sublime.packages_path(), server_dir)
-    self.ensime_executable = self.server_path + '/' + ("bin\\server.bat" if os.name == 'nt' else "bin/server")
+    server_dir = self.settings.get(
+      "ensime_server_path", "sublime_ensime\\server"
+      if os.name == 'nt' else "sublime_ensime/server")
+    self.server_path = (server_dir if (server_dir.startswith("/") or
+                                       (":/" in server_dir) or
+                                       (":\\" in server_dir))
+                        else os.path.join(sublime.packages_path(), server_dir))
+    self.ensime_executable = (self.server_path + '/' +
+                              ("bin\\server.bat" if os.name == 'nt'
+                               else "bin/server"))
     self.plugin_root = os.path.normpath(os.path.join(self.server_path, ".."))
     self.log_root = os.path.normpath(os.path.join(self.plugin_root, "logs"))
 
@@ -115,6 +110,7 @@ class EnsimeEnvironment(object):
     self.rv.settings().set("word_wrap", True)
     self.curr_sel = None
     self.prev_sel = None
+
 
 class EnsimeLog(object):
 
@@ -274,14 +270,15 @@ class EnsimeLog(object):
 
 class EnsimeBase(object):
   def __init__(self, owner):
+    env.environment_constructor = environment_constructor
     self.owner = owner
     if type(owner) == Window:
-      self.env = get_ensime_env(owner)
+      self.env = env.for_window(owner)
       self.w = owner
       self.v = owner.active_view()
       self.f = None
     elif type(owner) == View:
-      self.env = get_ensime_env(owner.window() or sublime.active_window())
+      self.env = env.for_window(owner.window() or sublime.active_window())
       self.w = owner.window()
       self.v = owner
       self.f = owner.file_name()
@@ -940,7 +937,9 @@ class EnsimeController(EnsimeCommon, EnsimeClientListener, EnsimeServerListener)
   def __getattr__(self, name):
     if name == "connected":
       # todo. can I write this in a concise way?
-      return self.client and self.client.socket and hasattr(self.client.socket, "connected") and self.client.socket.connected
+      return (self.client and self.client.socket and
+              hasattr(self.client.socket, "connected") and
+              self.client.socket.connected)
     raise AttributeError(str(self) + " does not have attribute " + name)
 
   def startup(self):
@@ -1220,19 +1219,24 @@ class EnsimeReplNextCommand(EnsimeTextCommand):
     self.repl_show()
 
 class EnsimeHighlights(EnsimeCommon):
+
   def hide(self):
     self.v.erase_regions("ensime-error")
     self.v.erase_regions("ensime-error-underline")
 
   def show(self):
-    relevant_notes = filter(lambda note: self.same_files(note.file_name, self.v.file_name()), self.env.notes)
+    self.show_notes(self.env.notes)
+
+  def show_notes(self, notes):
+    relevant_notes = filter(
+      lambda note: self.same_files(note.file_name, self.v.file_name()), notes)
 
     # Underline specific error range
-    underlines = [sublime.Region(note.start, note.end) for note in self.env.notes]
+    underlines = [sublime.Region(note.start, note.end) for note in relevant_notes]
     if self.env.settings.get("error_highlight") and self.env.settings.get("error_underline"):
       self.v.add_regions(
         "ensime-error-underline",
-        underlines,
+        underlines + self.v.get_regions("ensime-error-underline"),
         "invalid.illegal",
         sublime.DRAW_EMPTY_AS_OVERWRITE)
 
@@ -1241,24 +1245,26 @@ class EnsimeHighlights(EnsimeCommon):
     if self.env.settings.get("error_highlight"):
       self.v.add_regions(
         "ensime-error",
-        errors,
+        errors + self.v.get_regions("ensime-error"),
         "invalid.illegal",
         self.env.settings.get("error_icon", "dot"),
         sublime.DRAW_OUTLINED)
 
-    if self.env.settings.get("error_status"):
-      bol = self.v.line(self.v.sel()[0].begin()).begin()
-      eol = self.v.line(self.v.sel()[0].begin()).end()
-      msgs = [note.message for note in relevant_notes if (bol <= note.start and note.start <= eol) or (bol <= note.end and note.end <= eol)]
-      statusgroup = self.env.settings.get("ensime_statusbar_group", "ensime")
-      if msgs:
-        maxlength = self.env.settings.get("error_status_maxlength", 150)
-        status = "; ".join(msgs)
-        if len(status) > maxlength:
-          status = status[0:maxlength] + "..."
-        sublime.set_timeout(functools.partial(self.v.set_status, statusgroup, status), 100)
-      else:
-        self.v.erase_status(statusgroup)
+#    if self.env.settings.get("error_status"):
+#      bol = self.v.line(self.v.sel()[0].begin()).begin()
+#      eol = self.v.line(self.v.sel()[0].begin()).end()
+#      msgs = [note.message for note in relevant_notes
+#              if (bol <= note.start and note.start <= eol) or
+#              (bol <= note.end and note.end <= eol)]
+#      statusgroup = self.env.settings.get("ensime_statusbar_group", "ensime")
+#      if msgs:
+#        maxlength = self.env.settings.get("error_status_maxlength", 150)
+#        status = "; ".join(msgs)
+#        if len(status) > maxlength:
+#          status = status[0:maxlength] + "..."
+#        sublime.set_timeout(functools.partial(self.v.set_status, statusgroup, status), 100)
+#      else:
+#        self.v.erase_status(statusgroup)
 
   def refresh(self):
     if self.env.settings.get("error_highlight"):
@@ -1306,19 +1312,14 @@ class EnsimeHighlightDaemon(EventListener):
   def on_load(self, view):
     self.with_api(view, lambda api: api.type_check_file(view.file_name()))
 
-  def on_pre_save(self, view):
-    print "PRE-SAVE"
-
   def on_post_save(self, view):
-    print "POST-SAVE"
     self.with_api(view, lambda api: api.type_check_file(view.file_name()))
 
   def on_activate(self, view):
-    self.with_api(view, lambda api: EnsimeHighlights(view).refresh())
+    pass
 
   def on_selection_modified(self, view):
-    if view.sel():
-      self.with_api(view, lambda api: EnsimeHighlights(view).refresh())
+    pass
 
 # things might be simplified as per http://www.sublimetext.com/forum/viewtopic.php?f=6&t=7658
 class EnsimeCtrlClickDaemon(EventListener):
@@ -1433,3 +1434,10 @@ class EnsimeGoToDefinition(ProjectFileOnly, EnsimeTextCommand):
     else:
       statusmessage = "Definition of " + str(info.name) + " cannot be found"
       sublime.set_timeout(functools.partial(self.v.set_status, statusgroup, statusmessage), 100)
+
+
+
+
+
+
+
